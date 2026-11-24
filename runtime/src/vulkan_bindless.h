@@ -40,7 +40,8 @@
 //
 // If a replacement allocation fails, use host-visible memory when possible. If no allocation succeeds, the
 // current table can be rewritten after all its users finish, or retained until a later flush when an upload of
-// that table has reached the GPU. Removed indices stay reserved while a stale table can still name them.
+// that table has reached the GPU. Descriptor updates stay pending while the old table can still name their
+// indices, and removed indices stay reserved until a flush that does not degrade.
 //
 // Not thread-safe: the owner serialises calls.
 
@@ -522,9 +523,8 @@ public:
     // given, it is asked what has completed: the generations retired up to there are released and
     // the generation is tried again; when everything up to `retire_ticket` is done, nothing reads the current table
     // and it is rewritten in place if it is large enough. Failing both, the flush degrades instead of failing: the
-    // descriptors are written in place, as on a flush that does not replace the table (add_image writes new indices,
-    // which no key of the GPU's table reaches; remove_image writes the fallback, and the index stays held until a
-    // flush that does not degrade), the table keeps what it had, and its changes wait for a later flush
+    // table keeps what it had, and descriptor updates stay pending because the GPU's current table can still name
+    // the indices they would change. Keys added since find the fallback until a later successful flush
     // (last_flush_degraded()). Until the first successful upload a failed replacement still refuses the flush.
     bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0,
                const std::function<std::uint64_t()>& completed_ticket = {}) {
@@ -550,34 +550,34 @@ public:
         // (word 0 is the probe mask) and must refuse the flush.
         if (!written && must_replace && !table_on_gpu_) return false;
         if (!written && must_replace) {
-            // The current set is the one running work reads, and the table's changes may move or rebind live keys:
-            // they stay for a later flush, and keys added since find the fallback until then.
+            // The current set is the one running work reads. Keep both the table changes and descriptor updates
+            // pending: the old table can still name an index whose fallback or replacement is in pending_.
             ++degraded_flushes_;
             last_flush_degraded_ = true;
         }
-        for (const Pending& pending : pending_) {
-            if (pending.binding >= shadow_.size() || pending.index >= shadow_[pending.binding].size()) continue;
-            shadow_[pending.binding][pending.index] = pending.info;
-            shadow_written_[pending.binding][pending.index] = 1;
-        }
-        if (replaced) {
-            write_shadow();  // includes the pending writes just folded in
-        } else if (!pending_.empty()) {
-            std::vector<VkWriteDescriptorSet> writes(pending_.size());
-            for (std::size_t i = 0; i < pending_.size(); ++i) {
-                writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                writes[i].dstSet = set_;
-                writes[i].dstBinding = pending_[i].binding;
-                writes[i].dstArrayElement = pending_[i].index;
-                writes[i].descriptorCount = 1;
-                writes[i].descriptorType = bindless::bindings[pending_[i].binding].type;
-                writes[i].pImageInfo = &pending_[i].info;
-            }
-            vk_.vkUpdateDescriptorSets(device_, std::uint32_t(writes.size()), writes.data(), 0, nullptr);
-        }
-        pending_.clear();
-        pending_slots_.clear();
         if (!last_flush_degraded_) {
+            for (const Pending& pending : pending_) {
+                if (pending.binding >= shadow_.size() || pending.index >= shadow_[pending.binding].size()) continue;
+                shadow_[pending.binding][pending.index] = pending.info;
+                shadow_written_[pending.binding][pending.index] = 1;
+            }
+            if (replaced) {
+                write_shadow();  // includes the pending writes just folded in
+            } else if (!pending_.empty()) {
+                std::vector<VkWriteDescriptorSet> writes(pending_.size());
+                for (std::size_t i = 0; i < pending_.size(); ++i) {
+                    writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                    writes[i].dstSet = set_;
+                    writes[i].dstBinding = pending_[i].binding;
+                    writes[i].dstArrayElement = pending_[i].index;
+                    writes[i].descriptorCount = 1;
+                    writes[i].descriptorType = bindless::bindings[pending_[i].binding].type;
+                    writes[i].pImageInfo = &pending_[i].info;
+                }
+                vk_.vkUpdateDescriptorSets(device_, std::uint32_t(writes.size()), writes.data(), 0, nullptr);
+            }
+            pending_.clear();
+            pending_slots_.clear();
             // The table this flush leaves on the GPU names no removed index any more: they can be given out again.
             for (const auto& [dimension, index] : held_images_) image_used_[std::uint32_t(dimension)][index] = 0;
             for (const std::uint32_t index : held_samplers_) sampler_used_[index] = 0;
@@ -610,6 +610,10 @@ public:
     // How many generations flush() has made after the first, and how many wait for release_retired().
     std::uint64_t generations_made() const { return generations_made_; }
     std::size_t retired_count() const { return retired_.size(); }
+
+    // Descriptor updates waiting for a flush that can safely publish them. A degraded flush leaves these pending
+    // because the GPU's current table can still name the indices they would change.
+    std::size_t pending_write_count() const { return pending_.size(); }
 
     // Flushes that could not make the generation they needed and kept the previous table (see flush()), and whether
     // the last one did; flushes that rewrote the table in place instead, every submission being done.

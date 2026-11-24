@@ -178,6 +178,34 @@ int main() {
         EXPECT(frame());  // release the old generation
         EXPECT(set.retired_count() == 0);
 
+        // A live-key rebind under allocation pressure must not publish the old index's fallback while the GPU's
+        // current table still names it. The degraded flush keeps the descriptor writes pending until recovery.
+        const DescriptorKey victim = numbered(4000000);
+        const VkImageView victim_old_view = make_view();
+        const VkImageView victim_new_view = make_view();
+        EXPECT(victim_old_view && victim_new_view);
+        const std::uint32_t victim_old = set.add_image(ImageDimension::dim_2d, victim_old_view, VK_IMAGE_LAYOUT_GENERAL);
+        const std::uint32_t victim_new = set.add_image(ImageDimension::dim_2d, victim_new_view, VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(victim_old && victim_new && victim_old != victim_new);
+        EXPECT(set.insert_key(victim, victim_old) && frame());
+        g_fail = Fail::all;
+        g_fail_pools = true;
+        const auto degraded_before = set.degraded_flushes();
+        EXPECT(set.insert_key(victim, victim_new) && set.flush_replaces_table());
+        set.remove_image(ImageDimension::dim_2d, victim_old);
+        EXPECT(frame(true));
+        EXPECT(set.last_flush_degraded() && set.degraded_flushes() == degraded_before + 1);
+        EXPECT(set.pending_write_count() != 0);
+        g_fail = Fail::none;
+        g_fail_pools = false;
+        EXPECT(frame(true));
+        EXPECT(!set.last_flush_degraded() && set.pending_write_count() == 0);
+        EXPECT(set.erase_key(victim));
+        set.remove_image(ImageDimension::dim_2d, victim_new);
+        EXPECT(frame());
+        destroy_view(device.device, victim_old_view, nullptr);
+        destroy_view(device.device, victim_new_view, nullptr);
+
         // Nothing can be allocated and nothing runs: the table is rewritten in place.
         g_fail = Fail::all;
         g_fail_pools = true;
@@ -200,7 +228,7 @@ int main() {
         EXPECT(!frame(true) && set.last_failure_result() == VK_ERROR_DEVICE_LOST && !set.last_flush_degraded());
         g_fail = Fail::all;
         EXPECT(frame(true));
-        EXPECT(set.last_flush_degraded() && set.degraded_flushes() == 1);
+        EXPECT(set.last_flush_degraded() && set.degraded_flushes() == degraded_before + 2);
         EXPECT(set.last_failure() != nullptr && set.table_buffer_bytes() == bytes);
         EXPECT(set.flush_replaces_table());  // still owed
         // A texture goes while the GPU's table is stale: that table still maps its key to its index, so the index is
@@ -213,7 +241,7 @@ int main() {
         g_fail = Fail::none;  // only pool creation fails this time
         EXPECT(frame(true));
         EXPECT(!std::strcmp(set.last_failure(), "descriptor set"));
-        EXPECT(set.degraded_flushes() == 2 && set.free_images(ImageDimension::dim_2d) == free_before);
+        EXPECT(set.degraded_flushes() == degraded_before + 3 && set.free_images(ImageDimension::dim_2d) == free_before);
         EXPECT(add() && live.back().index != gone.index);
         g_fail = Fail::none;
         g_fail_pools = false;
