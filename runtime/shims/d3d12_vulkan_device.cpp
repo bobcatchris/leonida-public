@@ -5360,8 +5360,19 @@ public:
             // Under tracker_mutex_ (held from here to the submit) no other ExecuteCommandLists has recorded work that
             // is not yet submitted, so every submission that can have bound the set being replaced has a ticket up to
             // the one read here.
-            const bool flushed = state_.bindless->flush(command_buffer, context.submitted_retire_ticket());
-            if (flushed && state_.bindless->last_flush_replaced()) context.note_bindless_upload();
+            auto& set = *state_.bindless;
+            const auto rewrites = set.in_place_rewrites();
+            const bool flushed = set.flush(command_buffer, context.submitted_retire_ticket(),
+                                           [&context] { return context.completed_retire_ticket(); });
+            if (flushed && (set.last_flush_replaced() || set.in_place_rewrites() != rewrites))
+                context.note_bindless_upload();
+            if (set.last_flush_degraded()) {
+                const auto n = set.degraded_flushes();
+                if ((n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: bindless generation allocation failed (%s: %d); "
+                                         "using the previous table (%llu degraded flushes)\n",
+                                 set.last_failure(), int(set.last_failure_result()), static_cast<unsigned long long>(n));
+            }
             return flushed;
         });
         state_.context->set_bindless_current([this]() {

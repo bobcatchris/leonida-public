@@ -611,6 +611,9 @@ side inwards:
       covers a full 2048-sampler D3D12 heap plus room for literal and static S#s.
     - 2D images: up to 65536.
     - storage arrays: up to 4096 each.
+    - 2D-array images up to 16384, 3D and 1D images up to 4096 each (the title streams more cube maps, texture
+      arrays and 1D lookups than the defaults hold: each distinct T# of one takes its own index, and a native boot
+      filled the 1024 2D-array and 256 1D indices during the story load).
 
     Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
@@ -625,10 +628,10 @@ side inwards:
     the last free index, `CreateShaderResourceView` and `CreateSampler` log once that the array is full, and a
     shader reads the fallback. `d3d12_descriptor_test` then fills each short array to its last index and checks that
     the next view and sampler are refused.
-    The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
-    and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
-    descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
-    `bindless_sizing_test` checks the rules on synthetic limits.
+    The MS arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
+    and 4000 samplers) the set has 65536 2D images, 3936 samplers, 16384 2D-array, 4096 3D and 4096 1D images and
+    4096 storage indices in each dimension: 152929 descriptors, 5-10 MiB at 32-64 bytes a descriptor. The device
+    prints the counts it chose, and `bindless_sizing_test` checks the rules on synthetic limits.
   - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
     bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
     20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
@@ -745,7 +748,12 @@ D3D12 queue of the device is made in `info.queue_family`. And at most 8 retired 
 next flush waits (logged once, with the descriptor lock released) for the submissions up to the oldest one's ticket,
 which is a wait for those queues' timelines and not for the device. The commit of a submit's result runs under
 `tracker_mutex_`, so a later flush never sees an earlier submit's outcome unrecorded. If the new generation cannot be
-made (out of memory) the flush leaves the in-use set and the pending writes alone and fails.
+made, the table can use host-visible memory. If the allocation fails, the flush releases completed generations and
+retries. It can rewrite a table of sufficient size in place after all its users finish. Otherwise, if an upload of
+the current table reached the queue, the submission keeps that table and a later flush retries the change.
+Keys added since the last upload read the fallback, and a removed index stays reserved until the table catches up.
+A failed first upload still refuses the submission. `vk_bindless_grow_test` exercises these cases by refusing
+allocations on a real Vulkan device.
 Two bindless hazards that vkd3d-proton documents for games and that this change does not remove: descriptors
 written for resources allocated after the submit that reads them, and an image and a buffer descriptor aliasing one
 heap slot (vkd3d-proton PR #3033, https://github.com/HansKristian-Work/vkd3d-proton/pull/3033). Future path, not
